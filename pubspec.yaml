@@ -15,9 +15,7 @@ dependencies:
       ref: master
   flutter:
     sdk: flutter
-  # esc_pos_utils:
-  #   path: ../esc_pos_utils
-  image: ^3.0.2
+  image: ^4.0.02
 
 dev_dependencies:
   flutter_test:
