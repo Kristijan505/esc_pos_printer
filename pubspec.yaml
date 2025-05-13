@@ -5,7 +5,7 @@ homepage: https://github.com/andrey-ushakov/esc_pos_printer
 publish_to: none
 
 environment:
-  sdk: ">=2.12.0 <3.0.0"
+  sdk: ">=3.7.2 <4.0.0"
 
 dependencies:
   charset_converter: ^2.0.0
