@@ -19,6 +19,8 @@
 .vscode/
 
 # Flutter/Dart/Pub related
+/pubspec.lock
+/.flutter-plugins-dependencies
 **/doc/api/
 .dart_tool/
 .flutter-plugins

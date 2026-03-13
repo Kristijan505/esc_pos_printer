@@ -1,3 +1,12 @@
+## [5.0.0]
+
+- Bumped minimum SDK constraints to Dart `>=3.11.0 <4.0.0` and Flutter `>=3.41.0`.
+- Updated direct dependencies: `charset_converter` to `^2.3.0`, `image` to `^4.8.0`.
+- Pinned `esc_pos_utils` git dependency to commit `deee20c61573ca97bd5b041457832a4981b10cd0`.
+- Replaced legacy lint configuration with `flutter_lints`.
+- `NetworkPrinter.connect()` default port changed from `91000` to `9100`.
+- Added tests for explicit-port connection, default port behavior, and unreachable host timeout handling.
+
 ## [4.1.0]
 
 -Null-Safety
