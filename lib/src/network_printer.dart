@@ -38,9 +38,13 @@ class NetworkPrinter {
     try {
       _socket = await Socket.connect(host, port, timeout: timeout);
       _socket.add(_generator.reset());
-      return Future<PosPrintResult>.value(PosPrintResult.success);
+      // Metoda je `async`, pa se vrijednost vraca izravno. Omotavanje u
+      // `Future.value` unutar `try` bloka pali `unawaited_return_in_try_block`
+      // jer takav Future izmice `catch`-u; ovdje je bio bezopasan (vec
+      // dovrsen), ali izravan povratak je i jednostavniji i tocan.
+      return PosPrintResult.success;
     } catch (e) {
-      return Future<PosPrintResult>.value(PosPrintResult.timeout);
+      return PosPrintResult.timeout;
     }
   }
 

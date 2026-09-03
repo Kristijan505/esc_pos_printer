@@ -13,7 +13,7 @@ dependencies:
   esc_pos_utils:
     git:
       url: https://github.com/Kristijan505/esc_pos_utils.git
-      ref: deee20c61573ca97bd5b041457832a4981b10cd0
+      ref: 8d88b2e6caf7f20e355f6b96d7058ca171b025e9
   flutter:
     sdk: flutter
   image: ^4.8.0
