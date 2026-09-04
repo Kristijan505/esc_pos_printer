@@ -48,9 +48,25 @@ class NetworkPrinter {
     }
   }
 
+  /// Closes the connection to the printer.
+  ///
+  /// Waits for everything already written to reach the socket before tearing
+  /// it down. `Socket.destroy()` waits for nothing, so without the flush a
+  /// long receipt was silently truncated whenever the printer read slowly —
+  /// measured on a ~1 MB ticket against a receiver that paused for 500 ms,
+  /// only half of it arrived. The old `delayMs` could not help: it ran
+  /// *after* `destroy()`, when the unwritten bytes were already gone.
+  ///
   /// [delayMs]: milliseconds to wait after destroying the socket
-  void disconnect({int? delayMs}) async {
+  Future<void> disconnect({int? delayMs}) async {
+    try {
+      await _socket.flush();
+    } catch (_) {
+      // The connection is already broken; there is nothing left to flush.
+    }
+
     _socket.destroy();
+
     if (delayMs != null) {
       await Future.delayed(Duration(milliseconds: delayMs), () => null);
     }
