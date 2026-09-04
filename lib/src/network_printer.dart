@@ -24,7 +24,15 @@ class NetworkPrinter {
   String? _host;
   int? _port;
   late Generator _generator;
-  late Socket _socket;
+  /// Null until [connect] succeeds, and again after [disconnect].
+  ///
+  /// Callers wrap printing in `try`/`finally` and disconnect on every path,
+  /// including the one where `connect` returned [PosPrintResult.timeout]. With
+  /// a `late` field that teardown threw a LateInitializationError, which hid
+  /// the real failure behind a second, unrelated one.
+  Socket? _socketOrNull;
+
+  Socket get _socket => _socketOrNull!;
 
   int? get port => _port;
   String? get host => _host;
@@ -36,7 +44,7 @@ class NetworkPrinter {
     _host = host;
     _port = port;
     try {
-      _socket = await Socket.connect(host, port, timeout: timeout);
+      _socketOrNull = await Socket.connect(host, port, timeout: timeout);
       _socket.add(_generator.reset());
       // Metoda je `async`, pa se vrijednost vraca izravno. Omotavanje u
       // `Future.value` unutar `try` bloka pali `unawaited_return_in_try_block`
@@ -59,13 +67,20 @@ class NetworkPrinter {
   ///
   /// [delayMs]: milliseconds to wait after destroying the socket
   Future<void> disconnect({int? delayMs}) async {
+    final socket = _socketOrNull;
+
+    // Never connected, or already disconnected: nothing to flush or wait for.
+    if (socket == null) return;
+
+    _socketOrNull = null;
+
     try {
-      await _socket.flush();
+      await socket.flush();
     } catch (_) {
       // The connection is already broken; there is nothing left to flush.
     }
 
-    _socket.destroy();
+    socket.destroy();
 
     if (delayMs != null) {
       await Future.delayed(Duration(milliseconds: delayMs), () => null);

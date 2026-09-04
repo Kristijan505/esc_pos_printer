@@ -68,6 +68,25 @@ void main() {
   });
 
   group('NetworkPrinter.disconnect', () {
+    test('is safe when connect never succeeded', () async {
+      // `PrintExecution._izvrsiMreza` always calls `disconnect` in a `finally`,
+      // including the path where `connect` returned `timeout`. Blowing up there
+      // hides the real failure behind a LateInitializationError.
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+
+      final result = await printer.connect(
+        '256.256.256.256',
+        timeout: const Duration(milliseconds: 100),
+      );
+
+      expect(result, PosPrintResult.timeout);
+
+      await expectLater(printer.disconnect(delayMs: 1), completes);
+
+      // Calling it twice must not blow up either.
+      await expectLater(printer.disconnect(), completes);
+    });
+
     test('delivers everything written even when the printer reads slowly',
         () async {
       // `disconnect` used to call `Socket.destroy()` straight away, which
