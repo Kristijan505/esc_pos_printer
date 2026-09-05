@@ -56,6 +56,23 @@ class NetworkPrinter {
     }
   }
 
+  /// Waits until everything written so far has reached the socket.
+  ///
+  /// Throws if the connection broke in the meantime, so the caller can report
+  /// a failed print instead of assuming the receipt arrived. [disconnect]
+  /// swallows the very same error on purpose — tearing a connection down must
+  /// not fail — which makes this the only place where it can surface.
+  ///
+  /// Does nothing when there is no connection; that failure was already
+  /// reported by [connect].
+  Future<void> flush() async {
+    final socket = _socketOrNull;
+
+    if (socket == null) return;
+
+    await socket.flush();
+  }
+
   /// Closes the connection to the printer.
   ///
   /// Waits for everything already written to reach the socket before tearing

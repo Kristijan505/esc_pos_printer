@@ -67,6 +67,50 @@ void main() {
     });
   });
 
+  group('NetworkPrinter.flush', () {
+    test('surfaces a broken connection instead of pretending success',
+        () async {
+      // `disconnect` swallows this error so teardown cannot fail, which means
+      // a print would otherwise be logged as delivered even though the peer
+      // was gone. `flush` is what lets the caller notice.
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      final gone = Completer<void>();
+
+      server.listen((Socket client) {
+        client.destroy();
+        if (!gone.isCompleted) gone.complete();
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+
+      await gone.future.timeout(const Duration(seconds: 5));
+
+      // Big enough that it cannot all sit in the send buffer unnoticed.
+      printer.rawBytes(List<int>.filled(4 * 1024 * 1024, 0x41));
+
+      await expectLater(printer.flush(), throwsA(isA<SocketException>()));
+    }, timeout: const Timeout(Duration(seconds: 30)));
+
+    test('is a no-op when connect never succeeded', () async {
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+
+      await printer.connect(
+        '256.256.256.256',
+        timeout: const Duration(milliseconds: 100),
+      );
+
+      await expectLater(printer.flush(), completes);
+    });
+  });
+
   group('NetworkPrinter.disconnect', () {
     test('is safe when connect never succeeded', () async {
       // `PrintExecution._izvrsiMreza` always calls `disconnect` in a `finally`,
