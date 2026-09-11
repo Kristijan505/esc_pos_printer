@@ -382,11 +382,11 @@ void main() {
       // bi zaostali timer prerano prekinuo skupljanje ostatka. Da bi se taj
       // uski prozor pouzdano pogodio, upit je ovdje namjerno velik (`flush()`
       // onda potraje), pa server stigne odgovoriti prvim bajtom dok se upit
-      // jos salje -- iako je pravi upit statusa svega par bajtova. Razmak
-      // izmedju iducih bajtova je namjerno veci od `timeout` (da zaostali
-      // rok, ako bi ostao aktivan, stigne prekinuti skupljanje prije
-      // sljedeceg bajta) ali manji od `grace` (da se ispravno skupljanje ne
-      // prekine samo od sebe).
+      // jos salje -- iako je pravi upit statusa svega par bajtova. `grace` i
+      // razmak izmedju iducih bajtova su namjerno velikodusni (puno veci od
+      // kratkog `timeout`-a), da isporuka preostalih bajtova otporno podnese
+      // i eventualno usporenje event-loopa dok se veliki upit jos salje --
+      // zaostali rok (ako bi ostao aktivan) ionako puca vec za `timeout`.
       final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(() async {
         await server.close();
@@ -401,11 +401,11 @@ void main() {
           replied = true;
 
           client.add([0x01]);
-          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await Future<void>.delayed(const Duration(milliseconds: 500));
           client.add([0x02]);
-          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await Future<void>.delayed(const Duration(milliseconds: 500));
           client.add([0x03]);
-          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await Future<void>.delayed(const Duration(milliseconds: 500));
           client.add([0x04]);
         });
       });
@@ -420,7 +420,7 @@ void main() {
       final result = await printer.queryStatus(
         List<int>.filled(24 * 1024 * 1024, 0x00),
         timeout: const Duration(milliseconds: 50),
-        grace: const Duration(milliseconds: 200),
+        grace: const Duration(seconds: 2),
       );
 
       expect(result, Uint8List.fromList([0x01, 0x02, 0x03, 0x04]));
