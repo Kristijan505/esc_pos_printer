@@ -49,6 +49,24 @@ class NetworkPrinter {
   /// Koliko bajtova [_statusCompleter] ceka prije nego se sam dovrsi.
   int _statusMaxBytes = 0;
 
+  /// Koliko se jos ceka nakon SVAKOG novog bajta prije nego se
+  /// [_statusCompleter] dovrsi -- vidi [queryStatus].
+  Duration _statusGrace = const Duration(milliseconds: 50);
+
+  /// Rok za PRVI bajt tekuceg [queryStatus] poziva. Otkazuje se cim prvi
+  /// bajt stigne, jer od tog trenutka vise ne vrijedi `timeout` nego
+  /// [_statusGraceTimer].
+  Timer? _statusDeadlineTimer;
+
+  /// Kratki timer koji se restarta na svaki novi bajt dok se ceka odgovor;
+  /// dovrsava [_statusCompleter] cim protekne [_statusGrace] od zadnjeg
+  /// primljenog bajta -- vidi [queryStatus].
+  Timer? _statusGraceTimer;
+
+  /// Gornja granica [_incomingBuffer] dok nijedan [queryStatus] ne ceka
+  /// odgovor -- vidi [_trimIdleBuffer].
+  static const int _idleBufferCap = 256;
+
   /// Postavljeno cim `onError` ili `onDone` javi da je veza pukla, i vise se
   /// ne cisti -- veza se ionako mora ponovno uspostaviti kroz [connect].
   /// Koristi ga [queryStatus] da tisinu zivog printera razlikuje od mrtve
@@ -90,12 +108,50 @@ class NetworkPrinter {
 
   void _onIncomingData(Uint8List data) {
     _incomingBuffer.add(data);
+
     final completer = _statusCompleter;
-    if (completer != null &&
-        !completer.isCompleted &&
-        _incomingBuffer.length >= _statusMaxBytes) {
-      completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+    if (completer == null || completer.isCompleted) {
+      // Nijedan queryStatus ne ceka ovo -- vjerojatno ASB paket koji
+      // printer salje sam od sebe. Ne raste bez granice.
+      _trimIdleBuffer();
+      return;
     }
+
+    // Prvi (ili sljedeci) bajt je stigao, pa `timeout` rok za prvi bajt
+    // vise ne vrijedi -- od sada odlucuje samo jos [_statusGrace].
+    _statusDeadlineTimer?.cancel();
+    _statusDeadlineTimer = null;
+
+    if (_incomingBuffer.length >= _statusMaxBytes) {
+      _statusGraceTimer?.cancel();
+      _statusGraceTimer = null;
+      completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+      return;
+    }
+
+    // Restarta se na svaki novi bajt, da visebajtni odgovor stigne cijeli
+    // prije nego se completer dovrsi.
+    _statusGraceTimer?.cancel();
+    _statusGraceTimer = Timer(_statusGrace, () {
+      if (!completer.isCompleted) {
+        completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+      }
+    });
+  }
+
+  /// Bez ogranicenja bi dolazni bajtovi primljeni dok nijedan [queryStatus]
+  /// ne ceka odgovor (npr. ASB paketi koje printer salje sam od sebe tokom
+  /// cijelog dana ispisivanja) beskonacno rasli u memoriji. [queryStatus]
+  /// ionako isprazni spremnik prije svakog upita, pa se stariji ostaci ne
+  /// trebaju cuvati -- zadrzava se samo zadnjih [_idleBufferCap] bajtova.
+  void _trimIdleBuffer() {
+    if (_incomingBuffer.length <= _idleBufferCap) return;
+
+    final tail = _incomingBuffer
+        .toBytes()
+        .sublist(_incomingBuffer.length - _idleBufferCap);
+    _incomingBuffer.clear();
+    _incomingBuffer.add(tail);
   }
 
   void _onIncomingError(Object error) {
@@ -171,12 +227,18 @@ class NetworkPrinter {
   /// [request] su sirovi bajtovi upita (npr. `DLE EOT n` za real-time status,
   /// ili `GS r n` za queued status). Prije slanja isprazni se interni
   /// medjuspremnik primljenih bajtova, zatim se salje [request] i ceka
-  /// `flush()`, pa se sacekaju dolazni bajtovi dok ih se ne skupi [maxBytes]
-  /// ili dok ne istekne [timeout] -- sto prije nastupi. Vraca ono sto je do
-  /// tada skupljeno.
+  /// `flush()`.
   ///
-  /// PRAZAN rezultat je legitiman odgovor -- znaci da printer u zadanom
-  /// vremenu nije nista poslao -- i NIJE greska.
+  /// [timeout] je rok SAMO za PRVI bajt odgovora -- ako do njega nista ne
+  /// stigne u tom roku, vraca se prazan rezultat (vidi nize). Cim prvi bajt
+  /// stigne, `timeout` prestaje vrijediti i pocinje [grace]: kratak razmak
+  /// koji se restarta na svaki sljedeci bajt, tako da se visebajtni odgovor
+  /// priceka cijeli bez cekanja punog `timeout`-a. Cekanje zavrsava cim se
+  /// skupi [maxBytes] bajtova, ili cim od zadnjeg bajta protekne [grace] --
+  /// sto prije nastupi. Vraca ono sto je do tada skupljeno.
+  ///
+  /// PRAZAN rezultat je legitiman odgovor -- znaci da printer unutar
+  /// [timeout]-a nije nista poslao -- i NIJE greska.
   ///
   /// Zadani [timeout] od 600 ms odgovara `DLE EOT`: printer na njega
   /// odgovara odmah, iz prekidne rutine, pa je i par desetaka milisekundi
@@ -184,14 +246,17 @@ class NetworkPrinter {
   /// pozivatelj MORA podici [timeout] na nekoliko sekundi -- taj odgovor
   /// stize tek kad printer obradi sve sto je vec u njegovom bufferu ispred
   /// njega, pa kratak timeout ovdje redovito pogresno prijavi da printer ne
-  /// odgovara.
+  /// odgovara. Zadani [grace] od 50 ms vrijedi za oba slucaja podjednako,
+  /// jer se broji tek nakon sto je printer vec pocelo odgovarati.
   ///
-  /// Baca gresku ako veze uopce nema, ili ako je veza pukla (`onError` ili
+  /// Baca gresku ako veze uopce nema, ako je veza pukla (`onError` ili
   /// `onDone`) prije ili tijekom cekanja -- pozivatelj mora moci razlikovati
-  /// tisinu zivog printera od mrtve veze.
+  /// tisinu zivog printera od mrtve veze -- ili ako je drugi poziv
+  /// [queryStatus] vec u tijeku (pozivi se ne smiju preklapati).
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
+    final Duration grace = const Duration(milliseconds: 50),
     final int maxBytes = 16,
   }) async {
     final socket = _socketOrNull;
@@ -205,15 +270,24 @@ class NetworkPrinter {
       throw _brokenReason!;
     }
 
+    if (_statusCompleter != null && !_statusCompleter!.isCompleted) {
+      throw StateError(
+          'queryStatus: prethodni upit jos ceka odgovor -- pozivi se ne '
+          'smiju preklapati.');
+    }
+
     _incomingBuffer.clear();
     final completer = Completer<Uint8List>();
     _statusCompleter = completer;
     _statusMaxBytes = maxBytes;
+    _statusGrace = grace;
 
     socket.add(request);
     await flush();
 
-    final timer = Timer(timeout, () {
+    // Rok za PRVI bajt; nakon njega preuzima [_statusGraceTimer], pokrenut
+    // iz [_onIncomingData].
+    _statusDeadlineTimer = Timer(timeout, () {
       if (!completer.isCompleted) {
         completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
       }
@@ -222,7 +296,10 @@ class NetworkPrinter {
     try {
       return await completer.future;
     } finally {
-      timer.cancel();
+      _statusDeadlineTimer?.cancel();
+      _statusDeadlineTimer = null;
+      _statusGraceTimer?.cancel();
+      _statusGraceTimer = null;
       if (identical(_statusCompleter, completer)) {
         _statusCompleter = null;
       }

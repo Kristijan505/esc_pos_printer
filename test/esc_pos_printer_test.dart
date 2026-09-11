@@ -277,5 +277,101 @@ void main() {
         throwsA(isA<StateError>()),
       );
     });
+
+    test('a one-byte reply returns well before a long timeout', () async {
+      // `timeout` je rok samo za prvi bajt; jednom kad printer odgovori,
+      // ne smije se cekati puni `timeout` (bitno za `GS r` gdje je taj
+      // rok namjerno postavljen na nekoliko sekundi).
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        client.listen((Uint8List _) {
+          client.add([0x12]);
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final stopwatch = Stopwatch()..start();
+      final result = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        maxBytes: 1,
+        timeout: const Duration(seconds: 5),
+      );
+      stopwatch.stop();
+
+      expect(result, Uint8List.fromList([0x12]));
+      expect(stopwatch.elapsed, lessThan(const Duration(seconds: 1)));
+    });
+
+    test('a multi-byte reply is returned whole once it stops arriving',
+        () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        client.listen((Uint8List _) async {
+          // Salje odgovor bajt po bajt s malim razmakom, da se provjeri da
+          // `grace` ceka do zadnjeg bajta, a ne prekine na prvom.
+          for (final byte in const [0x01, 0x02, 0x03, 0x04]) {
+            client.add([byte]);
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+          }
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final result = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(seconds: 2),
+      );
+
+      expect(result, Uint8List.fromList([0x01, 0x02, 0x03, 0x04]));
+    });
+
+    test('rejects an overlapping call while one is in progress', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        // Namjerno ne odgovara, da prvi poziv ostane u tijeku.
+        client.listen((Uint8List _) {});
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final first = printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 300),
+      );
+
+      final overlapping = printer.queryStatus([0x10, 0x04, 0x01]);
+
+      await expectLater(overlapping, throwsA(isA<StateError>()));
+      await expectLater(first, completion(isEmpty));
+    });
   });
 }
