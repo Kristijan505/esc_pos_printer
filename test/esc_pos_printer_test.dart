@@ -373,5 +373,57 @@ void main() {
       await expectLater(overlapping, throwsA(isA<StateError>()));
       await expectLater(first, completion(isEmpty));
     });
+
+    test(
+        'a reply that starts immediately but trickles in survives a short '
+        'timeout', () async {
+      // Rubni slucaj: ako prvi bajt stigne JOS TIJEKOM `flush()`, rok za
+      // prvi bajt (`timeout`) ne smije ostati aktivan nakon toga -- inace
+      // bi zaostali timer prerano prekinuo skupljanje ostatka. Da bi se taj
+      // uski prozor pouzdano pogodio, upit je ovdje namjerno velik (`flush()`
+      // onda potraje), pa server stigne odgovoriti prvim bajtom dok se upit
+      // jos salje -- iako je pravi upit statusa svega par bajtova. Razmak
+      // izmedju iducih bajtova je namjerno veci od `timeout` (da zaostali
+      // rok, ako bi ostao aktivan, stigne prekinuti skupljanje prije
+      // sljedeceg bajta) ali manji od `grace` (da se ispravno skupljanje ne
+      // prekine samo od sebe).
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        var replied = false;
+        client.listen((Uint8List _) async {
+          // Veliki upit stize serveru u vise komada; odgovara se samo na
+          // prvi.
+          if (replied) return;
+          replied = true;
+
+          client.add([0x01]);
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          client.add([0x02]);
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          client.add([0x03]);
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          client.add([0x04]);
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final result = await printer.queryStatus(
+        List<int>.filled(24 * 1024 * 1024, 0x00),
+        timeout: const Duration(milliseconds: 50),
+        grace: const Duration(milliseconds: 200),
+      );
+
+      expect(result, Uint8List.fromList([0x01, 0x02, 0x03, 0x04]));
+    }, timeout: const Timeout(Duration(seconds: 30)));
   });
 }

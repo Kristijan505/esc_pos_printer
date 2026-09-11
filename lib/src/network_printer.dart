@@ -285,13 +285,19 @@ class NetworkPrinter {
     socket.add(request);
     await flush();
 
-    // Rok za PRVI bajt; nakon njega preuzima [_statusGraceTimer], pokrenut
-    // iz [_onIncomingData].
-    _statusDeadlineTimer = Timer(timeout, () {
-      if (!completer.isCompleted) {
-        completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
-      }
-    });
+    // Na lokalnoj mrezi printer zna odgovoriti JOS TIJEKOM ovog flush()-a --
+    // `_onIncomingData` je taj bajt tada vec obradio, otkazao (tada jos
+    // nepostojeci) `_statusDeadlineTimer` i pokrenuo `_statusGraceTimer`.
+    // Rok za prvi bajt se zato naoruzava SAMO ako do sada jos nista nije
+    // stiglo; inace bi zaostao i prerano prekinuo skupljanje visebajtnog
+    // odgovora koji stize sporije od `timeout`-a.
+    if (_incomingBuffer.length == 0 && !completer.isCompleted) {
+      _statusDeadlineTimer = Timer(timeout, () {
+        if (!completer.isCompleted) {
+          completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+        }
+      });
+    }
 
     try {
       return await completer.future;
