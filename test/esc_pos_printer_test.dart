@@ -183,4 +183,99 @@ void main() {
       expect(received.toBytes().length, greaterThanOrEqualTo(ticket.length));
     }, timeout: const Timeout(Duration(seconds: 60)));
   });
+
+  group('NetworkPrinter.queryStatus', () {
+    test('returns the byte the printer answers with', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        client.listen((Uint8List data) {
+          // Odgovara jednim bajtom, kao stvarni DLE EOT odgovor.
+          client.add([0x12]);
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final result = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        maxBytes: 1,
+        timeout: const Duration(seconds: 2),
+      );
+
+      expect(result, Uint8List.fromList([0x12]));
+    });
+
+    test('returns an empty result when the printer stays silent', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        // Namjerno ne odgovara -- printer koji ne podrzava upit.
+        client.listen((Uint8List _) {});
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final result = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 100),
+      );
+
+      expect(result, isEmpty);
+    });
+
+    test('throws when the connection breaks while waiting', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        client.listen((Uint8List _) {
+          // Prekida vezu umjesto da odgovori.
+          client.destroy();
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      await expectLater(
+        printer.queryStatus(
+          [0x10, 0x04, 0x01],
+          timeout: const Duration(seconds: 2),
+        ),
+        throwsA(anything),
+      );
+    });
+
+    test('throws when there is no connection', () async {
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+
+      await expectLater(
+        printer.queryStatus([0x10, 0x04, 0x01]),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
 }

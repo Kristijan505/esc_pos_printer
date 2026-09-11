@@ -6,8 +6,9 @@
  * See LICENSE for distribution and usage details.
  */
 
+import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data' show Uint8List;
+import 'dart:typed_data' show BytesBuilder, Uint8List;
 import 'package:esc_pos_utils/esc_pos_utils.dart';
 import 'package:image/image.dart';
 import './enums.dart';
@@ -32,6 +33,28 @@ class NetworkPrinter {
   /// the real failure behind a second, unrelated one.
   Socket? _socketOrNull;
 
+  /// Pretplata na dolazne bajtove sa socketa. `Socket` je single-subscription
+  /// stream pa se pretplacuje tocno jednom, u [connect]; [disconnect] je
+  /// otkazuje.
+  StreamSubscription<Uint8List>? _incomingSubscription;
+
+  /// Medjuspremnik bajtova primljenih otkad je [queryStatus] zadnji put
+  /// ispraznio spremnik.
+  final BytesBuilder _incomingBuffer = BytesBuilder();
+
+  /// Completer koji ceka odgovor za trenutni [queryStatus] poziv, ili null
+  /// ako se trenutno nista ne ceka.
+  Completer<Uint8List>? _statusCompleter;
+
+  /// Koliko bajtova [_statusCompleter] ceka prije nego se sam dovrsi.
+  int _statusMaxBytes = 0;
+
+  /// Postavljeno cim `onError` ili `onDone` javi da je veza pukla, i vise se
+  /// ne cisti -- veza se ionako mora ponovno uspostaviti kroz [connect].
+  /// Koristi ga [queryStatus] da tisinu zivog printera razlikuje od mrtve
+  /// veze.
+  Object? _brokenReason;
+
   Socket get _socket => _socketOrNull!;
 
   int? get port => _port;
@@ -45,6 +68,15 @@ class NetworkPrinter {
     _port = port;
     try {
       _socketOrNull = await Socket.connect(host, port, timeout: timeout);
+      _brokenReason = null;
+      _incomingBuffer.clear();
+      // Otvara se tocno jednom, ovdje -- `Socket` je single-subscription
+      // stream pa druga pretplata na isti socket baca gresku.
+      _incomingSubscription = _socket.listen(
+        _onIncomingData,
+        onError: _onIncomingError,
+        onDone: _onIncomingDone,
+      );
       _socket.add(_generator.reset());
       // Metoda je `async`, pa se vrijednost vraca izravno. Omotavanje u
       // `Future.value` unutar `try` bloka pali `unawaited_return_in_try_block`
@@ -53,6 +85,33 @@ class NetworkPrinter {
       return PosPrintResult.success;
     } catch (e) {
       return PosPrintResult.timeout;
+    }
+  }
+
+  void _onIncomingData(Uint8List data) {
+    _incomingBuffer.add(data);
+    final completer = _statusCompleter;
+    if (completer != null &&
+        !completer.isCompleted &&
+        _incomingBuffer.length >= _statusMaxBytes) {
+      completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+    }
+  }
+
+  void _onIncomingError(Object error) {
+    _brokenReason = error;
+    final completer = _statusCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.completeError(error);
+    }
+  }
+
+  void _onIncomingDone() {
+    _brokenReason ??=
+        const SocketException('Veza s printerom je zatvorena (onDone).');
+    final completer = _statusCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.completeError(_brokenReason!);
     }
   }
 
@@ -91,6 +150,9 @@ class NetworkPrinter {
 
     _socketOrNull = null;
 
+    await _incomingSubscription?.cancel();
+    _incomingSubscription = null;
+
     try {
       await socket.flush();
     } catch (_) {
@@ -101,6 +163,69 @@ class NetworkPrinter {
 
     if (delayMs != null) {
       await Future.delayed(Duration(milliseconds: delayMs), () => null);
+    }
+  }
+
+  /// Salje upit statusa printeru i ceka odgovor na vec otvorenoj vezi.
+  ///
+  /// [request] su sirovi bajtovi upita (npr. `DLE EOT n` za real-time status,
+  /// ili `GS r n` za queued status). Prije slanja isprazni se interni
+  /// medjuspremnik primljenih bajtova, zatim se salje [request] i ceka
+  /// `flush()`, pa se sacekaju dolazni bajtovi dok ih se ne skupi [maxBytes]
+  /// ili dok ne istekne [timeout] -- sto prije nastupi. Vraca ono sto je do
+  /// tada skupljeno.
+  ///
+  /// PRAZAN rezultat je legitiman odgovor -- znaci da printer u zadanom
+  /// vremenu nije nista poslao -- i NIJE greska.
+  ///
+  /// Zadani [timeout] od 600 ms odgovara `DLE EOT`: printer na njega
+  /// odgovara odmah, iz prekidne rutine, pa je i par desetaka milisekundi
+  /// dovoljno da se prepozna "nema odgovora". Za `GS r` (queued status)
+  /// pozivatelj MORA podici [timeout] na nekoliko sekundi -- taj odgovor
+  /// stize tek kad printer obradi sve sto je vec u njegovom bufferu ispred
+  /// njega, pa kratak timeout ovdje redovito pogresno prijavi da printer ne
+  /// odgovara.
+  ///
+  /// Baca gresku ako veze uopce nema, ili ako je veza pukla (`onError` ili
+  /// `onDone`) prije ili tijekom cekanja -- pozivatelj mora moci razlikovati
+  /// tisinu zivog printera od mrtve veze.
+  Future<Uint8List> queryStatus(
+    final List<int> request, {
+    final Duration timeout = const Duration(milliseconds: 600),
+    final int maxBytes = 16,
+  }) async {
+    final socket = _socketOrNull;
+    if (socket == null) {
+      throw StateError(
+          'queryStatus: printer nije povezan (connect nije uspio, ili je '
+          'vec pozvan disconnect).');
+    }
+
+    if (_brokenReason != null) {
+      throw _brokenReason!;
+    }
+
+    _incomingBuffer.clear();
+    final completer = Completer<Uint8List>();
+    _statusCompleter = completer;
+    _statusMaxBytes = maxBytes;
+
+    socket.add(request);
+    await flush();
+
+    final timer = Timer(timeout, () {
+      if (!completer.isCompleted) {
+        completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+      }
+    });
+
+    try {
+      return await completer.future;
+    } finally {
+      timer.cancel();
+      if (identical(_statusCompleter, completer)) {
+        _statusCompleter = null;
+      }
     }
   }
 
