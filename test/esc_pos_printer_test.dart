@@ -6,6 +6,16 @@ import 'package:esc_pos_printer/esc_pos_printer.dart';
 import 'package:esc_pos_utils/esc_pos_utils.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+/// Testni serveri koriste ovo da NE odgovore na `reset()` koji [connect]
+/// posalje prije svakog upita -- odgovor na pogresan bajt bi test ucinio
+/// tihim krivo-pozitivnim, umjesto da stvarno provjeri upit.
+bool _looksLikeStatusQuery(List<int> data) {
+  for (var i = 0; i + 1 < data.length; i++) {
+    if (data[i] == 0x10 && data[i + 1] == 0x04) return true;
+  }
+  return false;
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -192,7 +202,15 @@ void main() {
       });
 
       server.listen((Socket client) {
+        final received = BytesBuilder();
+        var replied = false;
         client.listen((Uint8List data) {
+          if (replied) return;
+          received.add(data);
+          // Ne odgovara na `reset()` koji connect() salje prije upita --
+          // samo na stvarni upit statusa.
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          replied = true;
           // Odgovara jednim bajtom, kao stvarni DLE EOT odgovor.
           client.add([0x12]);
         });
@@ -288,7 +306,13 @@ void main() {
       });
 
       server.listen((Socket client) {
-        client.listen((Uint8List _) {
+        final received = BytesBuilder();
+        var replied = false;
+        client.listen((Uint8List data) {
+          if (replied) return;
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          replied = true;
           client.add([0x12]);
         });
       });
@@ -320,7 +344,14 @@ void main() {
       });
 
       server.listen((Socket client) {
-        client.listen((Uint8List _) async {
+        final received = BytesBuilder();
+        var replied = false;
+        client.listen((Uint8List data) async {
+          if (replied) return;
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          replied = true;
+
           // Salje odgovor bajt po bajt s malim razmakom, da se provjeri da
           // `grace` ceka do zadnjeg bajta, a ne prekine na prvom.
           for (final byte in const [0x01, 0x02, 0x03, 0x04]) {
@@ -374,39 +405,211 @@ void main() {
       await expectLater(first, completion(isEmpty));
     });
 
-    test(
-        'a reply that starts immediately but trickles in survives a short '
-        'timeout', () async {
-      // Rubni slucaj: ako prvi bajt stigne JOS TIJEKOM `flush()`, rok za
-      // prvi bajt (`timeout`) ne smije ostati aktivan nakon toga -- inace
-      // bi zaostali timer prerano prekinuo skupljanje ostatka. Da bi se taj
-      // uski prozor pouzdano pogodio, upit je ovdje namjerno velik (`flush()`
-      // onda potraje), pa server stigne odgovoriti prvim bajtom dok se upit
-      // jos salje -- iako je pravi upit statusa svega par bajtova. `grace` i
-      // razmak izmedju iducih bajtova su namjerno velikodusni (puno veci od
-      // kratkog `timeout`-a), da isporuka preostalih bajtova otporno podnese
-      // i eventualno usporenje event-loopa dok se veliki upit jos salje --
-      // zaostali rok (ako bi ostao aktivan) ionako puca vec za `timeout`.
+    test('a printer that never reads does not hang the call forever',
+        () async {
+      // `timeout` sada pokriva i samo slanje: printer koji nikad ne cita
+      // puni TCP prozor, pa `flush()` moze visjeti zauvijek -- upravo
+      // takvog printera zelimo prijaviti kao "ne odgovara" umjesto da
+      // queryStatus visi zauvijek.
       final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(() async {
         await server.close();
       });
 
       server.listen((Socket client) {
-        var replied = false;
-        client.listen((Uint8List _) async {
-          // Veliki upit stize serveru u vise komada; odgovara se samo na
-          // prvi.
-          if (replied) return;
-          replied = true;
+        // Printer koji nikad ne cita -- pauzira pretplatu odmah, pa se
+        // primljeno ne prazni i TCP prozor se puni.
+        client.listen((Uint8List _) {}).pause();
+      });
 
-          client.add([0x01]);
-          await Future<void>.delayed(const Duration(milliseconds: 500));
-          client.add([0x02]);
-          await Future<void>.delayed(const Duration(milliseconds: 500));
-          client.add([0x03]);
-          await Future<void>.delayed(const Duration(milliseconds: 500));
-          client.add([0x04]);
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final stopwatch = Stopwatch()..start();
+      final result = await printer.queryStatus(
+        List<int>.filled(8 * 1024 * 1024, 0x00),
+        timeout: const Duration(milliseconds: 300),
+      );
+      stopwatch.stop();
+
+      expect(result, isEmpty);
+      expect(stopwatch.elapsed, lessThan(const Duration(seconds: 5)));
+    }, timeout: const Timeout(Duration(seconds: 15)));
+
+    test('a query after a failed send does not get stuck as "overlapping"',
+        () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        client.destroy();
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      // Prvi upit: veza puca dok se salje/ceka -- baca gresku. `socket.add`
+      // i `flush()` su sada UNUTAR try/finally, pa greska ovdje ne smije
+      // ostaviti `_statusCompleter` zauvijek postavljenim.
+      await expectLater(
+        printer.queryStatus(
+          [0x10, 0x04, 0x01],
+          timeout: const Duration(seconds: 2),
+        ),
+        throwsA(anything),
+      );
+
+      // Drugi upit odmah nakon ne smije pasti na "preklapanje" -- state iz
+      // prvog poziva mora biti pociscen bez obzira kojim je putem prvi
+      // pukao.
+      Object? secondError;
+      try {
+        await printer.queryStatus(
+          [0x10, 0x04, 0x01],
+          timeout: const Duration(milliseconds: 200),
+        );
+      } catch (e) {
+        secondError = e;
+      }
+
+      expect(secondError.toString(), isNot(contains('preklapaju')));
+    });
+
+    test('disconnect while a query is pending makes it throw', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        // Nikad ne odgovara -- upit ostaje visjeti dok ga disconnect() ne
+        // prekine.
+        client.listen((Uint8List _) {});
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+
+      final pending = printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(seconds: 5),
+      );
+      // Ocekivanje se vezuje ODMAH, prije bilo kojeg await-a -- inace Dart
+      // asinkroni Future koji jos nema slusatelja prijavi kao neuhvacenu
+      // gresku prije nego stignemo ovdje dolje pozvati expectLater.
+      final pendingThrows = expectLater(pending, throwsA(anything));
+
+      // Da upit sigurno bude u cekanju prije diskonekcije.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await printer.disconnect();
+
+      await pendingThrows;
+    });
+
+    test('reconnecting without disconnect() isolates the new connection',
+        () async {
+      final serverA =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverA.close();
+      });
+
+      Socket? clientA;
+      serverA.listen((Socket client) {
+        clientA = client;
+        addTearDown(client.destroy);
+        // Server A namjerno ne odgovara. connect() fix namjerno ne gasi
+        // stari socket (samo staru pretplatu) -- ostaje otvoren dok ga
+        // teardown ne unisti. Pisanje u njega kasnije u testu (nakon sto
+        // je klijent vec presao na B) zna zavrsiti greskom na `done` (peer
+        // je vec efektivno napusten), a to NIJE neuhvacena greska koju
+        // treba prijaviti.
+        unawaited(client.done.catchError((_) {}));
+        client.listen((Uint8List _) {}, onError: (Object _) {});
+      }, onError: (Object _) {});
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverA.port,
+      );
+
+      final pendingOnA = printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(seconds: 5),
+      );
+      // Ocekivanje se vezuje ODMAH, prije bilo kojeg await-a -- inace Dart
+      // asinkroni Future koji jos nema slusatelja prijavi kao neuhvacenu
+      // gresku prije nego stignemo dolje pozvati expectLater.
+      final pendingOnAThrows = expectLater(pendingOnA, throwsA(anything));
+
+      // Da se upit sigurno uhvati u cekanju prije reconnecta.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final serverB =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverB.close();
+      });
+      serverB.listen((Socket client) {
+        // Server B takodjer ne odgovara -- upit na njemu mora isteci
+        // prazan.
+        client.listen((Uint8List _) {});
+      });
+
+      // Reconnect BEZ disconnect() -- upit na A mora pasti greskom.
+      final reconnectResult = await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverB.port,
+      );
+      expect(reconnectResult, PosPrintResult.success);
+      addTearDown(() => printer.disconnect());
+
+      await pendingOnAThrows;
+
+      // Zakasnjeli bajt sa STAROG servera (A) ne smije dovrsiti upit na
+      // NOVOJ vezi (B).
+      clientA?.add([0xAA]);
+
+      final resultOnB = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 300),
+      );
+
+      expect(resultOnB, isEmpty);
+    }, timeout: const Timeout(Duration(seconds: 15)));
+
+    test('maxBytes truncates a larger single TCP event to the requested size',
+        () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        final received = BytesBuilder();
+        var replied = false;
+        client.listen((Uint8List data) {
+          if (replied) return;
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          replied = true;
+          // Odgovara sa 4 bajta odjednom, u JEDNOM paketu.
+          client.add([0x01, 0x02, 0x03, 0x04]);
         });
       });
 
@@ -418,12 +621,59 @@ void main() {
       addTearDown(() => printer.disconnect());
 
       final result = await printer.queryStatus(
-        List<int>.filled(24 * 1024 * 1024, 0x00),
-        timeout: const Duration(milliseconds: 50),
-        grace: const Duration(seconds: 2),
+        [0x10, 0x04, 0x01],
+        maxBytes: 1,
+        timeout: const Duration(seconds: 2),
       );
 
-      expect(result, Uint8List.fromList([0x01, 0x02, 0x03, 0x04]));
-    }, timeout: const Timeout(Duration(seconds: 30)));
+      expect(result, Uint8List.fromList([0x01]));
+    });
+
+    test('a delayed reply to a timed-out query does not leak into the next '
+        'one', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      var repliedOnce = false;
+      server.listen((Socket client) {
+        final received = BytesBuilder();
+        client.listen((Uint8List data) {
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          if (repliedOnce) return;
+          repliedOnce = true;
+          // Odgovara na PRVI upit tek 100 ms kasnije -- nakon sto ce
+          // klijent vec biti odustao od njega (rok mu je 50 ms). Na drugi
+          // upit se namjerno vise ne odgovara.
+          Future<void>.delayed(const Duration(milliseconds: 100), () {
+            client.add([0xAA]);
+          });
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final firstResult = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 50),
+      );
+      expect(firstResult, isEmpty);
+
+      // Drugi upit ne dobiva odgovor od servera -- zakasnjeli bajt s prvog
+      // upita ne smije zavrsiti njega.
+      final secondResult = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 300),
+      );
+
+      expect(secondResult, isEmpty);
+    }, timeout: const Timeout(Duration(seconds: 10)));
   });
 }

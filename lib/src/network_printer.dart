@@ -73,6 +73,13 @@ class NetworkPrinter {
   /// veze.
   Object? _brokenReason;
 
+  /// True ako je prethodni [queryStatus] istekao bez ijednog primljenog
+  /// bajta -- printer mu jos moze odgovoriti KASNIJE (tipicno queued
+  /// `GS r`), a taj zakasnjeli odgovor bi inace tiho zavrsio SLJEDECI,
+  /// nepovezani upit. Cisti se cim neki upit dobije bar jedan bajt, i u
+  /// [connect].
+  bool _previousQueryUnanswered = false;
+
   Socket get _socket => _socketOrNull!;
 
   int? get port => _port;
@@ -84,6 +91,24 @@ class NetworkPrinter {
       {int port = 9100, Duration timeout = const Duration(seconds: 5)}) async {
     _host = host;
     _port = port;
+
+    // Ako se connect() pozove iznova bez prethodnog disconnect() (npr.
+    // reconnect logika pozivatelja), stara pretplata i eventualni upit u
+    // tijeku ne smiju preziviti na novi socket -- inace dogadjaj sa
+    // STAROG socketa (npr. zakasnjeli onDone) moze dovrsiti upit koji ceka
+    // na NOVOM.
+    await _incomingSubscription?.cancel();
+    _incomingSubscription = null;
+    final stalePending = _statusCompleter;
+    if (stalePending != null && !stalePending.isCompleted) {
+      stalePending.completeError(StateError(
+          'queryStatus: connect() je pozvan iznova dok se cekao odgovor.'));
+    }
+    _statusCompleter = null;
+    _brokenReason = null;
+    _incomingBuffer.clear();
+    _previousQueryUnanswered = false;
+
     try {
       _socketOrNull = await Socket.connect(host, port, timeout: timeout);
       _brokenReason = null;
@@ -118,14 +143,22 @@ class NetworkPrinter {
     }
 
     // Prvi (ili sljedeci) bajt je stigao, pa `timeout` rok za prvi bajt
-    // vise ne vrijedi -- od sada odlucuje samo jos [_statusGrace].
+    // vise ne vrijedi -- od sada odlucuje samo jos [_statusGrace]. Printer
+    // je ocito ziv i odgovara, pa eventualna zabiljeska o prethodnom
+    // neodgovorenom upitu vise nije relevantna.
     _statusDeadlineTimer?.cancel();
     _statusDeadlineTimer = null;
+    _previousQueryUnanswered = false;
 
     if (_incomingBuffer.length >= _statusMaxBytes) {
       _statusGraceTimer?.cancel();
       _statusGraceTimer = null;
-      completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+      // Jedan TCP dogadjaj zna donijeti vise od maxBytes odjednom (npr. jos
+      // koji bajt zalijepljen uz odgovor) -- visak se odbacuje, jer
+      // pozivatelj trazi tocno maxBytes, ne "barem maxBytes".
+      final bytes = _incomingBuffer.toBytes();
+      completer
+          .complete(Uint8List.fromList(bytes.sublist(0, _statusMaxBytes)));
       return;
     }
 
@@ -197,6 +230,10 @@ class NetworkPrinter {
   /// only half of it arrived. The old `delayMs` could not help: it ran
   /// *after* `destroy()`, when the unwritten bytes were already gone.
   ///
+  /// If a [queryStatus] call is still waiting for an answer, it is
+  /// completed with an error here -- otherwise it would silently see an
+  /// empty result, indistinguishable from a live printer staying quiet.
+  ///
   /// [delayMs]: milliseconds to wait after destroying the socket
   Future<void> disconnect({int? delayMs}) async {
     final socket = _socketOrNull;
@@ -208,6 +245,15 @@ class NetworkPrinter {
 
     await _incomingSubscription?.cancel();
     _incomingSubscription = null;
+
+    // Otkazivanje pretplate ne zove onDone, pa bi aktivni upit inace tiho
+    // dobio prazan odgovor umjesto da vidi da mu je veza ugasena ispod
+    // njega -- pukla ili namjerno zatvorena veza nije tisina.
+    final pendingStatus = _statusCompleter;
+    if (pendingStatus != null && !pendingStatus.isCompleted) {
+      pendingStatus.completeError(StateError(
+          'queryStatus: disconnect() je pozvan dok se cekao odgovor.'));
+    }
 
     try {
       await socket.flush();
@@ -225,17 +271,29 @@ class NetworkPrinter {
   /// Salje upit statusa printeru i ceka odgovor na vec otvorenoj vezi.
   ///
   /// [request] su sirovi bajtovi upita (npr. `DLE EOT n` za real-time status,
-  /// ili `GS r n` za queued status). Prije slanja isprazni se interni
-  /// medjuspremnik primljenih bajtova, zatim se salje [request] i ceka
-  /// `flush()`.
+  /// ili `GS r n` za queued status).
   ///
-  /// [timeout] je rok SAMO za PRVI bajt odgovora -- ako do njega nista ne
-  /// stigne u tom roku, vraca se prazan rezultat (vidi nize). Cim prvi bajt
-  /// stigne, `timeout` prestaje vrijediti i pocinje [grace]: kratak razmak
-  /// koji se restarta na svaki sljedeci bajt, tako da se visebajtni odgovor
-  /// priceka cijeli bez cekanja punog `timeout`-a. Cekanje zavrsava cim se
-  /// skupi [maxBytes] bajtova, ili cim od zadnjeg bajta protekne [grace] --
-  /// sto prije nastupi. Vraca ono sto je do tada skupljeno.
+  /// Ako je PRETHODNI poziv istekao bez ijednog primljenog bajta, printer mu
+  /// jos moze odgovoriti KASNIJE -- ESC/POS odgovor ne nosi nikakvu oznaku
+  /// upita, pa bi taj zakasnjeli odgovor inace tiho zavrsio OVAJ, novi upit.
+  /// Taj se slucaj tada NE rjesava obicnim ciscenjem medjuspremnika, nego se
+  /// ceka [quietPeriod] tisine na liniji (uz gornju granicu od 1 s ukupnog
+  /// cekanja), odbacujuci sve sto u medjuvremenu stigne. Ovo je samo
+  /// UBLAZAVANJE, ne stvarno sparivanje odgovora s upitom -- transport nema
+  /// dovoljno informacija za to (ESC/POS odgovor ne nosi oznaku upita), pa
+  /// stvarno sparivanje (npr. po ocekivanim bitovima odgovora) mora raditi
+  /// pozivatelj.
+  ///
+  /// [timeout] je rok za CIJELO cekanje prvog bajta, UKLJUCUJUCI i samo
+  /// slanje -- printer koji je mrtav ili mu je pun TCP prozor moze uzrokovati
+  /// da samo slanje (`flush()`) nikad ne zavrsi, a upravo takvog printera
+  /// zelimo prijaviti kao "ne odgovara" umjesto da poziv visi zauvijek. Cim
+  /// prvi bajt stigne, `timeout` prestaje vrijediti i pocinje [grace]: kratak
+  /// razmak koji se restarta na svaki sljedeci bajt, tako da se visebajtni
+  /// odgovor priceka cijeli bez cekanja punog `timeout`-a. Cekanje zavrsava
+  /// cim se skupi [maxBytes] bajtova (visak iz istog TCP dogadjaja se
+  /// odbacuje), ili cim od zadnjeg bajta protekne [grace] -- sto prije
+  /// nastupi. Vraca ono sto je do tada skupljeno.
   ///
   /// PRAZAN rezultat je legitiman odgovor -- znaci da printer unutar
   /// [timeout]-a nije nista poslao -- i NIJE greska.
@@ -249,14 +307,15 @@ class NetworkPrinter {
   /// odgovara. Zadani [grace] od 50 ms vrijedi za oba slucaja podjednako,
   /// jer se broji tek nakon sto je printer vec pocelo odgovarati.
   ///
-  /// Baca gresku ako veze uopce nema, ako je veza pukla (`onError` ili
-  /// `onDone`) prije ili tijekom cekanja -- pozivatelj mora moci razlikovati
-  /// tisinu zivog printera od mrtve veze -- ili ako je drugi poziv
-  /// [queryStatus] vec u tijeku (pozivi se ne smiju preklapati).
+  /// Baca gresku ako veze uopce nema, ako je veza pukla (`onError`, `onDone`
+  /// ili `disconnect()`) prije ili tijekom cekanja -- pozivatelj mora moci
+  /// razlikovati tisinu zivog printera od mrtve veze -- ili ako je drugi
+  /// poziv [queryStatus] vec u tijeku (pozivi se ne smiju preklapati).
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
     final Duration grace = const Duration(milliseconds: 50),
+    final Duration quietPeriod = const Duration(milliseconds: 150),
     final int maxBytes = 16,
   }) async {
     final socket = _socketOrNull;
@@ -276,30 +335,47 @@ class NetworkPrinter {
           'smiju preklapati.');
     }
 
+    if (_previousQueryUnanswered) {
+      await _drainUntilQuiet(quietPeriod, const Duration(seconds: 1));
+
+      // Veza je mogla pasti dok se cekala tisina.
+      if (_socketOrNull == null) {
+        throw StateError(
+            'queryStatus: veza je zatvorena dok se cekalo da linija utihne.');
+      }
+      if (_brokenReason != null) {
+        throw _brokenReason!;
+      }
+    }
+
     _incomingBuffer.clear();
     final completer = Completer<Uint8List>();
     _statusCompleter = completer;
     _statusMaxBytes = maxBytes;
     _statusGrace = grace;
 
-    socket.add(request);
-    await flush();
-
-    // Na lokalnoj mrezi printer zna odgovoriti JOS TIJEKOM ovog flush()-a --
-    // `_onIncomingData` je taj bajt tada vec obradio, otkazao (tada jos
-    // nepostojeci) `_statusDeadlineTimer` i pokrenuo `_statusGraceTimer`.
-    // Rok za prvi bajt se zato naoruzava SAMO ako do sada jos nista nije
-    // stiglo; inace bi zaostao i prerano prekinuo skupljanje visebajtnog
-    // odgovora koji stize sporije od `timeout`-a.
-    if (_incomingBuffer.length == 0 && !completer.isCompleted) {
-      _statusDeadlineTimer = Timer(timeout, () {
-        if (!completer.isCompleted) {
-          completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
-        }
-      });
-    }
+    // Rok pokriva CIJELO cekanje, ukljucujuci i samo slanje -- vidi
+    // dokumentaciju gore. Naoruzava se PRIJE slanja; `_onIncomingData` ga
+    // otkazuje cim stigne prvi bajt.
+    _statusDeadlineTimer = Timer(timeout, () {
+      if (!completer.isCompleted) {
+        _previousQueryUnanswered = true;
+        completer.complete(Uint8List.fromList(_incomingBuffer.toBytes()));
+      }
+    });
 
     try {
+      socket.add(request);
+      // `flush()` moze visjeti ako printer ne cita (pun TCP prozor) -- rok
+      // gore to vec pokriva, pa se ne ceka izravno (`await`) ovdje; ako
+      // ipak BACI (npr. veza je vec pukla), ta se greska prosljedjuje kroz
+      // completer, osim ako je on vec zavrsio na neki drugi nacin.
+      unawaited(flush().then((_) {}, onError: (Object e, StackTrace st) {
+        if (!completer.isCompleted) {
+          completer.completeError(e, st);
+        }
+      }));
+
       return await completer.future;
     } finally {
       _statusDeadlineTimer?.cancel();
@@ -310,6 +386,25 @@ class NetworkPrinter {
         _statusCompleter = null;
       }
     }
+  }
+
+  /// Ceka da linija utihne prije novog upita -- vidi [queryStatus]. Ceka
+  /// [quietPeriod] bez ikakvog novog bajta, ili do isteka [cap] ukupno, sto
+  /// prije nastupi; sve primljeno u medjuvremenu se odbacuje.
+  Future<void> _drainUntilQuiet(Duration quietPeriod, Duration cap) async {
+    final stopwatch = Stopwatch()..start();
+    var lastLen = _incomingBuffer.length;
+
+    while (stopwatch.elapsed < cap) {
+      final remaining = cap - stopwatch.elapsed;
+      await Future<void>.delayed(
+          remaining < quietPeriod ? remaining : quietPeriod);
+
+      if (_incomingBuffer.length == lastLen) break;
+      lastLen = _incomingBuffer.length;
+    }
+
+    _incomingBuffer.clear();
   }
 
   // ************************ Printer Commands ************************
