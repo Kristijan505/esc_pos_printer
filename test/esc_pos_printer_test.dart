@@ -675,5 +675,116 @@ void main() {
 
       expect(secondResult, isEmpty);
     }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test('a query started while draining after a timeout still rejects '
+        'overlap', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        // Nikad ne odgovara.
+        client.listen((Uint8List _) {});
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      // Prvi upit istekne bez odgovora -- postavlja zabiljesku o
+      // neodgovorenom upitu, pa drugi upit mora prvo cekati tisinu.
+      final firstResult = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 50),
+      );
+      expect(firstResult, isEmpty);
+
+      // Drugi upit odmah ulazi u cekanje tisine (zadani quietPeriod od
+      // 150 ms), JOS PRIJE nego uopce posalje svoj zahtjev -- za to
+      // vrijeme mora vec biti "u tijeku", inace bi treci upit prosao
+      // preklapanje.
+      final second = printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(seconds: 2),
+      );
+      // Ocekivanje se vezuje ODMAH, prije bilo kojeg await-a.
+      final secondThrows = expectLater(second, throwsA(anything));
+
+      // Da drugi upit sigurno vec bude u cekanju tisine.
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+
+      await expectLater(
+        printer.queryStatus([0x10, 0x04, 0x01]),
+        throwsA(isA<StateError>()),
+      );
+
+      // Diskonektiraj da drugi upit zavrsi (baci) prije kraja testa.
+      await printer.disconnect();
+      await secondThrows;
+    }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test('a burst of more than 256 bytes while draining is not mistaken '
+        'for silence', () async {
+      // `_incomingBuffer` je ogranicen na 256 bajtova dok nijedan upit ne
+      // ceka -- ako se tisina mjeri po duljini spremnika, printer koji i
+      // dalje salje (spremnik vec pun i stoji na stropu) izgleda lazno
+      // tiho puno prije nego sto stvarno prestane.
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      var repliedOnce = false;
+      server.listen((Socket client) {
+        final received = BytesBuilder();
+        client.listen((Uint8List data) async {
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          if (repliedOnce) return;
+          repliedOnce = true;
+
+          // Ceka da klijent sigurno vec odustane od prvog upita (rok mu
+          // je 30 ms), pa salje preko 256 bajtova u kapaljkama razvucenim
+          // na oko 500 ms -- dulje od zadanog quietPeriod-a (150 ms). Na
+          // drugi upit se namjerno vise ne odgovara.
+          await Future<void>.delayed(const Duration(milliseconds: 80));
+          for (var i = 0; i < 25; i++) {
+            client.add(List<int>.filled(50, 0xFF));
+            await Future<void>.delayed(const Duration(milliseconds: 20));
+          }
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      final firstResult = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 30),
+      );
+      expect(firstResult, isEmpty);
+
+      final stopwatch = Stopwatch()..start();
+      final secondResult = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 150),
+      );
+      stopwatch.stop();
+
+      expect(secondResult, isEmpty);
+      // Mlaz (80 ms zakasnjenja + ~500 ms slanja) plus quietPeriod (150 ms)
+      // plus drugi upit svoj rok (150 ms) iznosi preko 700 ms -- mjereno
+      // po pogresno ogranicenoj duljini spremnika, cekanje bi lazno
+      // zavrsilo puno ranije.
+      expect(stopwatch.elapsed, greaterThan(const Duration(milliseconds: 550)));
+    }, timeout: const Timeout(Duration(seconds: 10)));
   });
 }
