@@ -1069,6 +1069,94 @@ void main() {
       expect(unexpectedQueryBeforeNewQuery, isFalse);
     }, timeout: const Timeout(Duration(seconds: 15)));
 
+    test(
+        'a stale drain must not clear bytes the new connection already '
+        'received', () async {
+      // Scenarij: upit koji ceka tisinu (drenaza) prezivi reconnect. Dok on
+      // jos spava, na NOVIOJ vezi vec zapocet upit primi dio svog odgovora.
+      // Kad se zastarjela drenaza probudi, njezino brisanje medjuspremnika
+      // ne smije pobrisati bajtove novog upita -- inace se odgovor vrati
+      // odrezan ili prazan.
+      final serverA =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverA.close();
+      });
+      serverA.listen((Socket client) {
+        // Server A nikad ne odgovara.
+        client.listen((Uint8List _) {});
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverA.port,
+      );
+
+      // Prvi upit istekne bez odgovora -- postavlja zabiljesku o
+      // neodgovorenom upitu, pa drugi upit prvo ulazi u drenazu.
+      final firstResult = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 30),
+      );
+      expect(firstResult, isEmpty);
+
+      // Zastarjeli upit zapocinje drenazu na A (quietPeriod 150 ms), a mi
+      // u medjuvremenu mijenjamo vezu.
+      final stale = printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(seconds: 2),
+      );
+      // Ocekivanje se vezuje ODMAH, prije bilo kojeg await-a.
+      final staleThrows = expectLater(stale, throwsA(isA<StateError>()));
+
+      // Da zastarjeli upit sigurno vec bude u cekanju tisine.
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+
+      final serverB =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverB.close();
+      });
+      serverB.listen((Socket client) {
+        final received = BytesBuilder();
+        var replied = false;
+        client.listen((Uint8List data) async {
+          if (replied) return;
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          replied = true;
+          // Prvi bajt odgovora stize brzo -- DOK zastarjela drenaza jos
+          // spava; drugi tek nakon njezinog prvog budjenja (~150 ms). Bez
+          // fixa bi drenaza kod budjenja pobrisala prvi bajt, pa bi upit
+          // vratio samo [0x22].
+          client.add([0x11]);
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          client.add([0x22]);
+        });
+      });
+
+      await printer.disconnect();
+      final reconnectResult = await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverB.port,
+      );
+      expect(reconnectResult, PosPrintResult.success);
+      addTearDown(() => printer.disconnect());
+
+      // Novi upit na NOVOJ vezi: maxBytes i grace su namjerno taki da
+      // completer jos ceka kad se zastarjela drenaza budi.
+      final result = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        maxBytes: 4,
+        grace: const Duration(milliseconds: 400),
+        timeout: const Duration(seconds: 2),
+      );
+
+      expect(result, Uint8List.fromList([0x11, 0x22]));
+      await staleThrows;
+    }, timeout: const Timeout(Duration(seconds: 15)));
+
     test('invalid arguments throw ArgumentError without changing state',
         () async {
       final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);

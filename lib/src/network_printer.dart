@@ -481,7 +481,8 @@ class NetworkPrinter {
 
     try {
       if (_previousQueryUnanswered) {
-        await _drainUntilQuiet(quietPeriod, const Duration(seconds: 1));
+        await _drainUntilQuiet(quietPeriod, const Duration(seconds: 1),
+            generation: myGeneration);
 
         if (_connectionGeneration != myGeneration) {
           throw StateError(
@@ -559,7 +560,14 @@ class NetworkPrinter {
   /// [_incomingBuffer] -- ona [_trimIdleBuffer] drzi na [_idleBufferCap] dok
   /// nijedan upit ne ceka, pa bi printer koji i dalje salje (spremnik vec
   /// pun) izgledao lazno tiho.
-  Future<void> _drainUntilQuiet(Duration quietPeriod, Duration cap) async {
+  ///
+  /// Drenaza je vezana uz [generation] -- generaciju veze na kojoj je
+  /// pokrenuta. Ako se veza u medjuvremenu zamijeni (connect) ili zatvori
+  /// (disconnect), cekanje se prekida BEZ ciscenja [_incomingBuffer]: on od
+  /// tada pripada novoj vezi, na kojoj medjuvremenu zapoceti upit vec moze
+  /// primati svoj odgovor -- brisanje bi mu tiho odrezalo primljene bajtove.
+  Future<void> _drainUntilQuiet(Duration quietPeriod, Duration cap,
+      {required int generation}) async {
     final stopwatch = Stopwatch()..start();
     var lastCount = _totalBytesReceived;
 
@@ -568,6 +576,7 @@ class NetworkPrinter {
       await Future<void>.delayed(
           remaining < quietPeriod ? remaining : quietPeriod);
 
+      if (_connectionGeneration != generation) return;
       if (_totalBytesReceived == lastCount) break;
       lastCount = _totalBytesReceived;
     }
