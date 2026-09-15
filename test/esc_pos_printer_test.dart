@@ -75,6 +75,192 @@ void main() {
 
       expect(result, PosPrintResult.timeout);
     });
+
+    test(
+        'clears the stale socket when a reconnect fails, so queryStatus '
+        'does not write into it', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        // Prihvaca vezu, ali nikad ne odgovara.
+        client.listen((Uint8List _) {}, onError: (Object _) {});
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      final firstResult = await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      expect(firstResult, PosPrintResult.success);
+
+      // Port na kojem sigurno nitko ne slusa -- server se veze samo da mu
+      // se uzme slobodan broj porta, pa se odmah zatvara.
+      final closedServer =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final deadPort = closedServer.port;
+      await closedServer.close();
+
+      final reconnectResult = await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: deadPort,
+        timeout: const Duration(seconds: 2),
+      );
+      expect(reconnectResult, PosPrintResult.timeout);
+
+      // queryStatus mora prijaviti da printer nije spojen -- BEZ fixa bi
+      // `_socketOrNull` i dalje pokazivao na PRVI (napusten) socket, pa bi
+      // upit prosao provjeru spojenosti i pisao u vezu s koje se odgovor
+      // vise ne moze vidjeti.
+      await expectLater(
+        printer.queryStatus([0x10, 0x04, 0x01]),
+        throwsA(isA<StateError>()),
+      );
+    }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test(
+        'a second connect() started right after the first invalidates it, '
+        'even once the first socket briefly connects', () async {
+      final serverA =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverA.close();
+      });
+      final serverB =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverB.close();
+      });
+
+      Socket? clientA;
+      final acceptedOnA = Completer<void>();
+      serverA.listen((Socket client) {
+        clientA = client;
+        if (!acceptedOnA.isCompleted) acceptedOnA.complete();
+        // NetworkPrinter unistava (RST) ovaj socket gotovo istog trena
+        // nakon sto ga uspostavi. Pisanje u njega kasnije u testu
+        // (`clientA?.add(...)`) zna zavrsiti greskom na `done`, ne na samom
+        // `add()` pozivu (IOSink pise asinkrono) -- to NIJE neuhvacena
+        // greska koju treba prijaviti (isti obrazac kao u
+        // "reconnecting without disconnect() isolates the new connection").
+        unawaited(client.done.catchError((_) {}));
+        client.listen((Uint8List _) {}, onError: (Object _) {});
+      });
+
+      final receivedOnB = BytesBuilder();
+      var repliedOnB = false;
+      serverB.listen((Socket client) {
+        client.listen((Uint8List data) {
+          if (repliedOnB) return;
+          receivedOnB.add(data);
+          if (!_looksLikeStatusQuery(receivedOnB.toBytes())) return;
+          repliedOnB = true;
+          client.add([0x99]);
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+
+      // connect() na A se NE ceka do kraja -- pusta mu se TOCNO jedan
+      // mikrozadatak da prodje kroz sinkroni pocetak i UDJE u pravi
+      // `Socket.connect`, prije nego connect() na B (ispod) preuzme
+      // generaciju. Bez ovog koraka bi drugi connect() -- pozvan sasvim
+      // sinkrono odmah nakon prvog -- uvijek nadjacao prvi jos PRIJE nego
+      // se ovaj uopce pokusa spojiti (nova generacija se povecava sinkrono,
+      // prije ijednog stvarnog await-a), pa se ne bi provjerio i slucaj
+      // koji ovaj test cilja: da prvi socket UISTINU nakratko uspije, a
+      // onda ga drugi connect() zatekne i unisti.
+      final firstConnect = printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverA.port,
+      );
+      await Future<void>.value();
+
+      final secondConnect = printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverB.port,
+      );
+
+      final firstResult = await firstConnect;
+      final secondResult = await secondConnect;
+
+      expect(secondResult, PosPrintResult.success);
+      expect(firstResult, PosPrintResult.timeout);
+      addTearDown(() => printer.disconnect());
+
+      await acceptedOnA.future.timeout(const Duration(seconds: 2));
+
+      // Podaci koje A posalje NE smiju dovrsiti upit niti postaviti
+      // "broken" stanje na aktivnoj vezi (B).
+      try {
+        clientA?.add([0xAA]);
+      } catch (_) {
+        // Veza je vec zatvorena/resetirana -- svejedno, cilj je provjeriti
+        // da to ne utjece na aktivnu (B) vezu.
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final resultOnB = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        maxBytes: 1,
+        timeout: const Duration(seconds: 2),
+      );
+
+      expect(resultOnB, Uint8List.fromList([0x99]));
+    }, timeout: const Timeout(Duration(seconds: 15)));
+
+    test('disconnect() called while connect() is establishing invalidates it',
+        () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      final acceptedClient = Completer<Socket>();
+      final clientClosed = Completer<void>();
+      server.listen((Socket client) {
+        if (!acceptedClient.isCompleted) acceptedClient.complete(client);
+        client.listen((Uint8List _) {}, onDone: () {
+          if (!clientClosed.isCompleted) clientClosed.complete();
+        }, onError: (Object _) {
+          if (!clientClosed.isCompleted) clientClosed.complete();
+        });
+      }, onError: (Object _) {
+        // Benigna trka na razini test servera -- ne dio ponasanja koje se
+        // ovdje testira.
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+
+      // Isti razlog kao u testu iznad: pusta se TOCNO jedan mikrozadatak da
+      // connect() prodje kroz sinkroni pocetak i UDJE u pravi
+      // `Socket.connect`, prije nego ga disconnect() ispod poništi -- da se
+      // provjeri bas slucaj kad se socket UISTINU nakratko uspostavi, a
+      // onda ga disconnect() zatekne i unisti.
+      final connectFuture = printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      await Future<void>.value();
+
+      await printer.disconnect();
+
+      final result = await connectFuture;
+      expect(result, PosPrintResult.timeout);
+
+      // Printer ne smije zavrsiti spojen.
+      await expectLater(
+        printer.queryStatus([0x10, 0x04, 0x01]),
+        throwsA(isA<StateError>()),
+      );
+
+      // Socket koji je connect() ipak nakratko uspostavio mora biti
+      // unisten -- server vidi da je klijent zatvorio vezu.
+      await acceptedClient.future.timeout(const Duration(seconds: 2));
+      await clientClosed.future.timeout(const Duration(seconds: 2));
+    }, timeout: const Timeout(Duration(seconds: 10)));
   });
 
   group('NetworkPrinter.flush', () {
@@ -532,12 +718,13 @@ void main() {
       serverA.listen((Socket client) {
         clientA = client;
         addTearDown(client.destroy);
-        // Server A namjerno ne odgovara. connect() fix namjerno ne gasi
-        // stari socket (samo staru pretplatu) -- ostaje otvoren dok ga
-        // teardown ne unisti. Pisanje u njega kasnije u testu (nakon sto
-        // je klijent vec presao na B) zna zavrsiti greskom na `done` (peer
-        // je vec efektivno napusten), a to NIJE neuhvacena greska koju
-        // treba prijaviti.
+        // Server A namjerno ne odgovara. Reconnect (connect() pozvan iznova
+        // bez disconnect()) sada aktivno unistava stari (klijentski) socket
+        // -- vidi fix za "clear the stale socket when a reconnect fails" --
+        // pa server A ovaj `client` uskoro vidi kao zatvorenog s druge
+        // strane. Pisanje u njega kasnije u testu (nakon sto je klijent vec
+        // presao na B) zna zavrsiti greskom na `done` ili na `add`, a to
+        // NIJE neuhvacena greska koju treba prijaviti.
         unawaited(client.done.catchError((_) {}));
         client.listen((Uint8List _) {}, onError: (Object _) {});
       }, onError: (Object _) {});

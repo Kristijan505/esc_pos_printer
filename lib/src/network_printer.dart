@@ -101,6 +101,14 @@ class NetworkPrinter {
   /// reconnecta, a jos ceka tisinu, mogao poslati zahtjev na NOVU vezu i
   /// preoteti stanje/timere upitu koji je u medjuvremenu vec zapocet na
   /// njoj.
+  ///
+  /// [connect] ga povecava SINKRONO, prije prvog `await`, i pamti svoju
+  /// vrijednost lokalno -- tako dva [connect] poziva bez medjusobnog
+  /// cekanja odmah dobiju razlicite generacije, pa raniji poziv, kad se
+  /// probudi iz svog await-a, prepozna da je nadjacan i povuce se bez
+  /// diranja stanja koje je noviji poziv u medjuvremenu preuzeo. [disconnect]
+  /// ga povecava bez obzira ima li trenutno spojen socket, da ponisti i
+  /// [connect] koji jos ceka na `Socket.connect`.
   int _connectionGeneration = 0;
 
   Socket get _socket => _socketOrNull!;
@@ -115,12 +123,28 @@ class NetworkPrinter {
     _host = host;
     _port = port;
 
+    // Nova generacija -- vidi [_connectionGeneration]. Povecava se SINKRONO,
+    // prije bilo kojeg `await` nize, da dva connect() poziva bez
+    // medjusobnog cekanja odmah uhvate SVOJU, razlicitu generaciju prije
+    // nego ijedan preda kontrolu event loopu. Bez toga bi oba poziva,
+    // probudivsi se iz istog await-a, mislila da su "trenutni" i svaki bi
+    // instalirao svoj listener -- zadnji bi prepisao polja, ali raniji
+    // listener bi ostao ziv i njegovi dogadjaji (npr. odgovor sa STAROG
+    // servera) mogli bi dovrsiti upit ili postaviti prekinuto stanje na
+    // NOVOJ vezi.
+    _connectionGeneration++;
+    final myGeneration = _connectionGeneration;
+
     // Ako se connect() pozove iznova bez prethodnog disconnect() (npr.
-    // reconnect logika pozivatelja), stara pretplata i eventualni upit u
-    // tijeku ne smiju preziviti na novi socket -- inace dogadjaj sa
-    // STAROG socketa (npr. zakasnjeli onDone) moze dovrsiti upit koji ceka
-    // na NOVOM.
-    await _incomingSubscription?.cancel();
+    // reconnect logika pozivatelja, ili drugi paralelni connect() poziv),
+    // stara pretplata i eventualni upit u tijeku ne smiju preziviti na novi
+    // socket -- inace dogadjaj sa STAROG socketa (npr. zakasnjeli onDone)
+    // moze dovrsiti upit koji ceka na NOVOM. Ovaj dio je namjerno sinkron i
+    // idempotentan (izvrsava se prije prvog await-a): ako dva connect()
+    // poziva trce jedan za drugim bez cekanja, prvi ovdje pociste sve stare
+    // reference i postavi ih na null, pa drugi ovdje zatekne vec pociscene
+    // vrijednosti i ne radi nista dvaput.
+    final staleSubscription = _incomingSubscription;
     _incomingSubscription = null;
     final stalePending = _statusCompleter;
     if (stalePending != null && !stalePending.isCompleted) {
@@ -132,29 +156,76 @@ class NetworkPrinter {
     _incomingBuffer.clear();
     _previousQueryUnanswered = false;
     _queryInProgress = false;
-    // Nova generacija -- vidi [_connectionGeneration]. Povecava se ovdje
-    // bez obzira hoce li Socket.connect() dolje uspjeti, jer je ova stara
-    // veza vec napustena u oba slucaja.
-    _connectionGeneration++;
+
+    // Stari socket se odvaja i unistava PRIJE Socket.connect nize -- ako
+    // spojen printer dobije neuspjeli reconnect (Socket.connect dolje
+    // baci), `_socketOrNull` ne smije i dalje pokazivati na staru vezu
+    // ciju je pretplata upravo otkazana: queryStatus bi inace prosao
+    // provjeru spojenosti i pisao u vezu s koje se odgovor vise ne moze
+    // vidjeti, a i obican ispis bi gadjao napustenu vezu.
+    final staleSocket = _socketOrNull;
+    _socketOrNull = null;
+    staleSocket?.destroy();
+
+    await staleSubscription?.cancel();
+
+    // Ako je u medjuvremenu (dok se cekao cancel() gore) zapocet NOVIJI
+    // connect() poziv, on je vec uhvatio noviju generaciju gore, sinkrono,
+    // pa je ovaj (stariji) poziv nadjacan -- povlaci se bez ikakve daljnje
+    // izmjene stanja, da ne prepise ono sto je noviji poziv u medjuvremenu
+    // vec postavio.
+    if (_connectionGeneration != myGeneration) {
+      return PosPrintResult.timeout;
+    }
 
     try {
-      _socketOrNull = await Socket.connect(host, port, timeout: timeout);
+      final socket = await Socket.connect(host, port, timeout: timeout);
+
+      // Isto kao gore, ali nakon Socket.connect -- ako se generacija u
+      // medjuvremenu promijenila (noviji connect() ili disconnect() dok se
+      // cekalo na TCP handshake), ovaj socket vise nije zeljen. Unisti se
+      // odmah i ne diraj nikakvo stanje -- ne instalirati listener koji bi
+      // pripadao tudjoj generaciji.
+      if (_connectionGeneration != myGeneration) {
+        socket.destroy();
+        return PosPrintResult.timeout;
+      }
+
+      _socketOrNull = socket;
       _brokenReason = null;
       _incomingBuffer.clear();
       // Otvara se tocno jednom, ovdje -- `Socket` je single-subscription
-      // stream pa druga pretplata na isti socket baca gresku.
-      _incomingSubscription = _socket.listen(
-        _onIncomingData,
-        onError: _onIncomingError,
-        onDone: _onIncomingDone,
+      // stream pa druga pretplata na isti socket baca gresku. Svaki
+      // callback provjerava generaciju PRIJE bilo cega drugog, tako da
+      // dogadjaji sa socketa zastarjele generacije (npr. ako se u
+      // medjuvremenu vec pozvao novi connect()/disconnect()) nikad ne
+      // diraju tekuce stanje.
+      _incomingSubscription = socket.listen(
+        (Uint8List data) {
+          if (_connectionGeneration != myGeneration) return;
+          _onIncomingData(data);
+        },
+        onError: (Object error) {
+          if (_connectionGeneration != myGeneration) return;
+          _onIncomingError(error);
+        },
+        onDone: () {
+          if (_connectionGeneration != myGeneration) return;
+          _onIncomingDone();
+        },
       );
-      _socket.add(_generator.reset());
+      socket.add(_generator.reset());
       // Metoda je `async`, pa se vrijednost vraca izravno. Omotavanje u
       // `Future.value` unutar `try` bloka pali `unawaited_return_in_try_block`
       // jer takav Future izmice `catch`-u; ovdje je bio bezopasan (vec
       // dovrsen), ali izravan povratak je i jednostavniji i tocan.
       return PosPrintResult.success;
     } catch (e) {
+      // Ako je generacija u medjuvremenu vec zamijenjena, stanje pripada
+      // novijem pozivu -- ne dirati ga.
+      if (_connectionGeneration == myGeneration) {
+        _socketOrNull = null;
+      }
       return PosPrintResult.timeout;
     }
   }
@@ -266,6 +337,15 @@ class NetworkPrinter {
   ///
   /// [delayMs]: milliseconds to wait after destroying the socket
   Future<void> disconnect({int? delayMs}) async {
+    // Nova generacija -- vidi [_connectionGeneration]. Povecava se OVDJE,
+    // bez obzira je li trenutno nesto spojeno -- tako disconnect() koji
+    // stigne dok [connect] jos ceka `Socket.connect` (i `_socketOrNull` je
+    // jos uvijek null, jer connect() stari socket odvaja PRIJE tog await-a)
+    // svejedno ponisti taj connect(): kad se on probudi, prepoznat ce
+    // promijenjenu generaciju, unistiti tek uspostavljeni socket i vratiti
+    // timeout umjesto da ostavi vezu otvorenom ispod ove diskonekcije.
+    _connectionGeneration++;
+
     final socket = _socketOrNull;
 
     // Never connected, or already disconnected: nothing to flush or wait for.
@@ -285,8 +365,6 @@ class NetworkPrinter {
           'queryStatus: disconnect() je pozvan dok se cekao odgovor.'));
     }
     _queryInProgress = false;
-    // Nova generacija -- vidi [_connectionGeneration].
-    _connectionGeneration++;
 
     try {
       await socket.flush();
