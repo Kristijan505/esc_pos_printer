@@ -94,6 +94,15 @@ class NetworkPrinter {
   /// stropu dok printer i dalje salje).
   int _totalBytesReceived = 0;
 
+  /// Povecava se u [connect] i [disconnect] -- svaka (ponovna) uspostava
+  /// ili prekid veze pocinje novu generaciju. [queryStatus] njome
+  /// prepoznaje da je veza zamijenjena ili zatvorena dok je on cekao tisinu
+  /// u [_drainUntilQuiet]: bez ove provjere bi upit koji je zapoceo PRIJE
+  /// reconnecta, a jos ceka tisinu, mogao poslati zahtjev na NOVU vezu i
+  /// preoteti stanje/timere upitu koji je u medjuvremenu vec zapocet na
+  /// njoj.
+  int _connectionGeneration = 0;
+
   Socket get _socket => _socketOrNull!;
 
   int? get port => _port;
@@ -123,6 +132,10 @@ class NetworkPrinter {
     _incomingBuffer.clear();
     _previousQueryUnanswered = false;
     _queryInProgress = false;
+    // Nova generacija -- vidi [_connectionGeneration]. Povecava se ovdje
+    // bez obzira hoce li Socket.connect() dolje uspjeti, jer je ova stara
+    // veza vec napustena u oba slucaja.
+    _connectionGeneration++;
 
     try {
       _socketOrNull = await Socket.connect(host, port, timeout: timeout);
@@ -272,6 +285,8 @@ class NetworkPrinter {
           'queryStatus: disconnect() je pozvan dok se cekao odgovor.'));
     }
     _queryInProgress = false;
+    // Nova generacija -- vidi [_connectionGeneration].
+    _connectionGeneration++;
 
     try {
       await socket.flush();
@@ -329,6 +344,10 @@ class NetworkPrinter {
   /// ili `disconnect()`) prije ili tijekom cekanja -- pozivatelj mora moci
   /// razlikovati tisinu zivog printera od mrtve veze -- ili ako je drugi
   /// poziv [queryStatus] vec u tijeku (pozivi se ne smiju preklapati).
+  ///
+  /// Baca `ArgumentError` -- bez da isprazni bilo kakvo stanje ili posalje
+  /// ijedan bajt -- ako je [request] prazan, ako [maxBytes] nije pozitivan,
+  /// ili ako je bilo koji od [timeout]/[grace]/[quietPeriod] negativan.
   Future<Uint8List> queryStatus(
     final List<int> request, {
     final Duration timeout = const Duration(milliseconds: 600),
@@ -336,8 +355,28 @@ class NetworkPrinter {
     final Duration quietPeriod = const Duration(milliseconds: 150),
     final int maxBytes = 16,
   }) async {
-    final socket = _socketOrNull;
-    if (socket == null) {
+    // Provjera argumenata ide PRIJE bilo kakvog postavljanja stanja -- npr.
+    // negativan maxBytes bi kasnije bacio unutar _onIncomingData (kroz
+    // sublist), sto ne prolazi kroz completer i ostavlja queryStatus da
+    // visi zauvijek jer je rok vec otkazan.
+    if (request.isEmpty) {
+      throw ArgumentError.value(request, 'request', 'ne smije biti prazan.');
+    }
+    if (maxBytes <= 0) {
+      throw ArgumentError.value(maxBytes, 'maxBytes', 'mora biti pozitivan.');
+    }
+    if (timeout.isNegative) {
+      throw ArgumentError.value(timeout, 'timeout', 'ne smije biti negativan.');
+    }
+    if (grace.isNegative) {
+      throw ArgumentError.value(grace, 'grace', 'ne smije biti negativan.');
+    }
+    if (quietPeriod.isNegative) {
+      throw ArgumentError.value(
+          quietPeriod, 'quietPeriod', 'ne smije biti negativan.');
+    }
+
+    if (_socketOrNull == null) {
       throw StateError(
           'queryStatus: printer nije povezan (connect nije uspio, ili je '
           'vec pozvan disconnect).');
@@ -357,20 +396,33 @@ class NetworkPrinter {
           'smiju preklapati.');
     }
     _queryInProgress = true;
+    // Vidi [_connectionGeneration]: ako se promijeni dok cekamo tisinu
+    // nize, veza je zamijenjena (novi connect()) ili zatvorena
+    // (disconnect()) ispod ovog poziva.
+    final myGeneration = _connectionGeneration;
 
     try {
       if (_previousQueryUnanswered) {
         await _drainUntilQuiet(quietPeriod, const Duration(seconds: 1));
 
-        // Veza je mogla pasti dok se cekala tisina.
-        if (_socketOrNull == null) {
+        if (_connectionGeneration != myGeneration) {
           throw StateError(
-              'queryStatus: veza je zatvorena dok se cekalo da linija '
-              'utihne.');
+              'queryStatus: veza je zamijenjena ili zatvorena dok se '
+              'cekalo da linija utihne.');
         }
         if (_brokenReason != null) {
           throw _brokenReason!;
         }
+      }
+
+      // Socket se uzima TEK ovdje -- nakon eventualnog cekanja na tisinu
+      // gore -- da se upit posalje na TRENUTNU vezu, a ne na onu uhvacenu
+      // prije cekanja (koja je u medjuvremenu mogla biti zamijenjena).
+      final socket = _socketOrNull;
+      if (socket == null) {
+        throw StateError(
+            'queryStatus: veza je zatvorena dok se cekalo da linija '
+            'utihne.');
       }
 
       _incomingBuffer.clear();
@@ -412,7 +464,12 @@ class NetworkPrinter {
         }
       }
     } finally {
-      _queryInProgress = false;
+      // Samo ako je generacija ista kao na pocetku -- inace bi ovaj (stari)
+      // poziv obrisao zastavicu upita koji je u medjuvremenu vec zapocet
+      // na NOVOJ vezi.
+      if (_connectionGeneration == myGeneration) {
+        _queryInProgress = false;
+      }
     }
   }
 

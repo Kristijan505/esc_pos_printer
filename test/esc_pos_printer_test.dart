@@ -786,5 +786,171 @@ void main() {
       // zavrsilo puno ranije.
       expect(stopwatch.elapsed, greaterThan(const Duration(milliseconds: 550)));
     }, timeout: const Timeout(Duration(seconds: 10)));
+
+    test(
+        'disconnect() + connect() while draining invalidates the stale '
+        'query', () async {
+      final serverA =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverA.close();
+      });
+
+      serverA.listen((Socket client) {
+        // Server A nikad ne odgovara.
+        client.listen((Uint8List _) {});
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverA.port,
+      );
+
+      // Prvi upit istekne bez odgovora -- postavlja zabiljesku o
+      // neodgovorenom upitu.
+      final firstResult = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(milliseconds: 30),
+      );
+      expect(firstResult, isEmpty);
+
+      // Drugi (zastarjeli) upit odmah ulazi u cekanje tisine na A, JOS
+      // PRIJE nego uopce posalje bilo sto.
+      final stale = printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        timeout: const Duration(seconds: 2),
+      );
+      // Ocekivanje se vezuje ODMAH, prije bilo kojeg await-a.
+      final staleThrows = expectLater(stale, throwsA(isA<StateError>()));
+
+      // Da zastarjeli upit sigurno vec bude u cekanju tisine.
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+
+      final serverB =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await serverB.close();
+      });
+
+      // Zastarjeli upit ne smije nista poslati serveru B -- provjeri se da
+      // B ne primi upit statusa PRIJE nego sto novi upit uistinu krene.
+      // (connect() svejedno salje reset() odmah, pa se to ne racuna.)
+      var newQueryStarted = false;
+      var unexpectedQueryBeforeNewQuery = false;
+      final earlyBytes = BytesBuilder();
+      final received = BytesBuilder();
+      var repliedOnB = false;
+      serverB.listen((Socket client) {
+        client.listen((Uint8List data) {
+          if (!newQueryStarted) {
+            earlyBytes.add(data);
+            if (_looksLikeStatusQuery(earlyBytes.toBytes())) {
+              unexpectedQueryBeforeNewQuery = true;
+            }
+          }
+          if (repliedOnB) return;
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          repliedOnB = true;
+          client.add([0x12]);
+        });
+      });
+
+      // disconnect() + connect() na NOVI server, dok zastarjeli upit jos
+      // ceka tisinu na starome.
+      await printer.disconnect();
+      final reconnectResult = await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: serverB.port,
+      );
+      expect(reconnectResult, PosPrintResult.success);
+      addTearDown(() => printer.disconnect());
+
+      // Zastarjeli upit mora baciti -- veza mu je zamijenjena ispod njega.
+      await staleThrows;
+
+      // Novi upit na NOVOJ vezi radi normalno.
+      newQueryStarted = true;
+      final result = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        maxBytes: 1,
+        timeout: const Duration(seconds: 2),
+      );
+
+      expect(result, Uint8List.fromList([0x12]));
+      expect(unexpectedQueryBeforeNewQuery, isFalse);
+    }, timeout: const Timeout(Duration(seconds: 15)));
+
+    test('invalid arguments throw ArgumentError without changing state',
+        () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        await server.close();
+      });
+
+      server.listen((Socket client) {
+        final received = BytesBuilder();
+        var replied = false;
+        client.listen((Uint8List data) {
+          if (replied) return;
+          received.add(data);
+          if (!_looksLikeStatusQuery(received.toBytes())) return;
+          replied = true;
+          client.add([0x12]);
+        });
+      });
+
+      final printer = NetworkPrinter(PaperSize.mm80, profile);
+      await printer.connect(
+        InternetAddress.loopbackIPv4.address,
+        port: server.port,
+      );
+      addTearDown(() => printer.disconnect());
+
+      await expectLater(
+        printer.queryStatus(<int>[]),
+        throwsA(isA<ArgumentError>()),
+      );
+      await expectLater(
+        printer.queryStatus([0x10, 0x04, 0x01], maxBytes: 0),
+        throwsA(isA<ArgumentError>()),
+      );
+      await expectLater(
+        printer.queryStatus([0x10, 0x04, 0x01], maxBytes: -1),
+        throwsA(isA<ArgumentError>()),
+      );
+      await expectLater(
+        printer.queryStatus(
+          [0x10, 0x04, 0x01],
+          timeout: const Duration(milliseconds: -1),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      await expectLater(
+        printer.queryStatus(
+          [0x10, 0x04, 0x01],
+          grace: const Duration(milliseconds: -1),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      await expectLater(
+        printer.queryStatus(
+          [0x10, 0x04, 0x01],
+          quietPeriod: const Duration(milliseconds: -1),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+
+      // Nijedan od gornjih poziva nije smio promijeniti stanje -- sljedeci
+      // ispravan upit radi normalno.
+      final result = await printer.queryStatus(
+        [0x10, 0x04, 0x01],
+        maxBytes: 1,
+        timeout: const Duration(seconds: 2),
+      );
+
+      expect(result, Uint8List.fromList([0x12]));
+    });
   });
 }
